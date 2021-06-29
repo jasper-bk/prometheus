@@ -14,10 +14,13 @@
 package textparse
 
 import (
+	"bytes"
+	"encoding/binary"
 	"fmt"
 	"io"
 
-	"github.com/matttproud/golang_protobuf_extensions/pbutil"
+	"github.com/gogo/protobuf/proto"
+	"github.com/pkg/errors"
 
 	"github.com/prometheus/prometheus/pkg/exemplar"
 	"github.com/prometheus/prometheus/pkg/histogram"
@@ -33,20 +36,15 @@ import (
 // format that will be used for sparse histograms), we probably need to rewrite
 // the whole parsing part again.
 type ProtobufParser struct {
+	reader io.Reader
+	inMF   bool // True while processing a MetricFamily.
+	mf     *dto.MetricFamily
 }
 
 func NewProtobufParser(b []byte) Parser {
-	for {
-		mf := &dto.MetricFamily{}
-		if _, err = pbutil.ReadDelimited(resp.Body, mf); err != nil {
-			if err == io.EOF {
-				break
-			}
-			return fmt.Errorf("reading metric family protocol buffer failed: %v", err)
-		}
-		ch <- mf
+	return &ProtobufParser{
+		reader: bytes.NewReader(b),
 	}
-	return &ProtobufParser{}
 }
 
 // Series returns the bytes of a series with a simple float64 as a
@@ -80,19 +78,13 @@ func (p *ProtobufParser) Type() ([]byte, MetricType) {
 	return nil, ""
 }
 
-// Unit returns the metric name and unit in the current entry.
-// Must only be called after Next returned a unit entry.
-// The returned byte slices become invalid after the next call to Next.
 func (p *ProtobufParser) Unit() ([]byte, []byte) {
 	// TODO
 	return nil, nil
 }
 
-// Comment returns the text of the current comment.
-// Must only be called after Next returned a comment entry.
-// The returned byte slice becomes invalid after the next call to Next.
+// Comment isn't supported by the protobuf format, so this always returns nil.
 func (p *ProtobufParser) Comment() []byte {
-	// TODO
 	return nil
 }
 
@@ -112,6 +104,60 @@ func (p *ProtobufParser) Exemplar(l *exemplar.Exemplar) bool {
 // Next advances the parser to the next "sample" (emulating the behavior of a
 // text format parser). It returns io.EOF if no samples were read.
 func (p *ProtobufParser) Next() (Entry, error) {
-	// TODO
+	for {
+		mf := &dto.MetricFamily{}
+		if _, err := readDelimited(bytes.NewReader(b), mf); err != nil {
+			if err == io.EOF {
+				break
+			}
+			fmt.Printf("reading metric family protocol buffer failed: %v\n", err)
+		}
+		fmt.Println(*mf)
+	}
+
 	return EntryInvalid, io.EOF
+}
+
+var errInvalidVarint = errors.New("invalid varint32 encountered")
+
+// readDelimited is broadly inspired by
+// github.com/matttproud/golang_protobuf_extensions/pbutil , but it is specific
+// to a MetricFamily and acts on a byte slice directly.
+func readDelimited(r io.Reader, mf *dto.MetricFamily) (n int, err error) {
+	// Per AbstractParser#parsePartialDelimitedFrom with
+	// CodedInputStream#readRawVarint32.
+	var headerBuf [binary.MaxVarintLen32]byte
+	var bytesRead, varIntBytes int
+	var messageLength uint64
+	for varIntBytes == 0 { // i.e. no varint has been decoded yet.
+		if bytesRead >= len(headerBuf) {
+			return bytesRead, errInvalidVarint
+		}
+		// We have to read byte by byte here to avoid reading more bytes
+		// than required. Each read byte is appended to what we have
+		// read before.
+		newBytesRead, err := r.Read(headerBuf[bytesRead : bytesRead+1])
+		if newBytesRead == 0 {
+			if err != nil {
+				return bytesRead, err
+			}
+			// A Reader should not return (0, nil), but if it does,
+			// it should be treated as no-op (according to the
+			// Reader contract). So let's go on...
+			continue
+		}
+		bytesRead += newBytesRead
+		// Now present everything read so far to the varint decoder and
+		// see if a varint can be decoded already.
+		messageLength, varIntBytes = proto.DecodeVarint(headerBuf[:bytesRead])
+	}
+
+	messageBuf := make([]byte, messageLength)
+	newBytesRead, err := io.ReadFull(r, messageBuf)
+	bytesRead += newBytesRead
+	if err != nil {
+		return bytesRead, err
+	}
+
+	return bytesRead, proto.Unmarshal(messageBuf, m)
 }
